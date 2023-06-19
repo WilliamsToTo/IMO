@@ -15,6 +15,7 @@ We use conda to manage python packages.
 git clone https://github.com/yourusername/IMG.git
 cd IMG
 conda env create -n IMG --file environment.yml
+conda activate IMG
 ```
 
 ## Usage
