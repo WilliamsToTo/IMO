@@ -1,0 +1,2 @@
+original mapping: {0:negative, 1:neutral, 2:positive}
+processed mapping: {0:negative, 1:positive}

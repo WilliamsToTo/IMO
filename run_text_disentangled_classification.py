@@ -48,19 +48,38 @@ from transformers import (
 from transformers.utils import check_min_version, get_full_repo_name, send_example_telemetry
 from transformers.utils.versions import require_version
 from utils import set_every_seed
+from models.modeling_m2m_100 import M2M100ForDisentangledRepresentation, M2M100ForSequenceClassification
 from models.modeling_bart import (
     BartForSequenceClassification,
+    BartForTokenAttentionCLS,
+    BartForDisentangledRepresentation,
+    BartForDisentangledRepresentation_incremental,
+    BartForTokenAttentionSparseCLS,
     BartForTokenAttentionSparseCLSJoint,
+    BartForTokenAttentionSparseCLSJoint_incremental,
+    BartForTokenAttentionSparseCLSJoint_incremental_1minusMask,
+    BartForTokenAttentionSparseCLSJoint_MaskLayer,
+    BartForTokenAttentionSparseCLSJointSTE,
+    BartForTokenAttentionSparseCLSJointScalar,
+    BartForTokenAttentionSparseCLSJointSTR,
+    BartForTokenAttentionSparseCLSJoint_1minusMask,
 )
 
 from models.modeling_bert import (
-    BertForTokenAttentionSparseCLSJoint
+    BertForSequenceClassification,
+    BertForTokenAttentionSparseCLSJoint,
+    BertForTokenAttentionSparseCLSJoint_incremental,
 )
 
 from models.modeling_t5 import (
-    T5ForTokenAttentionSparseCLSJoint
+    T5ForSequenceClassification,
+    T5ForTokenAttentionSparseCLSJoint,
+    T5ForTokenAttentionSparseCLSJoint_incremental
 )
 
+from models.modeling_mbart import (
+    MBartForSequenceClassification
+)
 
 
 
@@ -112,6 +131,14 @@ def parse_args():
         "--model_class", type=str, default=None, help="BartForSequenceClassification, BartForTokenAttentionCLS, "
                                                       "BartForDisentangledRepresentation, BartForTokenAttentionSparseCLS,"
                                                       "BartForTokenAttentionSparseCLSJoint"
+    )
+    parser.add_argument(
+        "--hidden_state_layer",
+        type=int,
+        default=12,
+        help=(
+            "indicates which layer's output as features."
+        ),
     )
     parser.add_argument(
         "--max_length",
@@ -181,7 +208,7 @@ def parse_args():
         "--num_warmup_steps", type=int, default=0, help="Number of steps for the warmup in the lr scheduler."
     )
     parser.add_argument("--output_dir", type=str, default=None, help="Where to store the final model.")
-    parser.add_argument("--seed", type=int, default=1000, help="1000, 415, A seed for reproducible training.")
+    parser.add_argument("--seed", type=int, default=415, help="1000, 415, 512, 120, 70.")
     parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
     parser.add_argument(
         "--hub_model_id", type=str, help="The name of the repository to keep in sync with the local `output_dir`."
@@ -348,6 +375,35 @@ def main():
             config=config,
             ignore_mismatched_sizes=args.ignore_mismatched_sizes,
         )
+    elif args.model_class =="MBartForSequenceClassification":
+        model = MBartForSequenceClassification.from_pretrained(
+            args.model_name_or_path,
+            from_tf=bool(".ckpt" in args.model_name_or_path),
+            config=config,
+            ignore_mismatched_sizes=args.ignore_mismatched_sizes,
+        )
+    elif args.model_class == "BartForTokenAttentionCLS":
+        model = BartForTokenAttentionCLS.from_pretrained(
+            args.model_name_or_path,
+            from_tf=bool(".ckpt" in args.model_name_or_path),
+            config=config,
+            ignore_mismatched_sizes=args.ignore_mismatched_sizes,
+        )
+    elif args.model_class == "BartForDisentangledRepresentation":
+        model = BartForDisentangledRepresentation.from_pretrained(
+            args.model_name_or_path,
+            from_tf=bool(".ckpt" in args.model_name_or_path),
+            config=config,
+            ignore_mismatched_sizes=args.ignore_mismatched_sizes,
+        )
+    elif args.model_class == "BartForDisentangledRepresentation_incremental":
+        model = BartForDisentangledRepresentation_incremental.from_pretrained(
+            args.model_name_or_path,
+            from_tf=bool(".ckpt" in args.model_name_or_path),
+            config=config,
+            ignore_mismatched_sizes=args.ignore_mismatched_sizes,
+            training_mask_layer=args.hidden_state_layer
+        )
     elif args.model_class == "BartForTokenAttentionSparseCLSJoint":
         model = BartForTokenAttentionSparseCLSJoint.from_pretrained(
             args.model_name_or_path,
@@ -355,8 +411,77 @@ def main():
             config=config,
             ignore_mismatched_sizes=args.ignore_mismatched_sizes,
         )
+    elif args.model_class == "BartForTokenAttentionSparseCLSJoint_MaskLayer":
+        model = BartForTokenAttentionSparseCLSJoint_MaskLayer.from_pretrained(
+            args.model_name_or_path,
+            from_tf=bool(".ckpt" in args.model_name_or_path),
+            config=config,
+            ignore_mismatched_sizes=args.ignore_mismatched_sizes,
+        )
+    elif args.model_class == "BartForTokenAttentionSparseCLSJoint_incremental_1minusMask":
+        model = BartForTokenAttentionSparseCLSJoint_incremental_1minusMask.from_pretrained(
+            args.model_name_or_path,
+            from_tf=bool(".ckpt" in args.model_name_or_path),
+            config=config,
+            ignore_mismatched_sizes=args.ignore_mismatched_sizes,
+            training_mask_layer=args.hidden_state_layer
+        )
+    elif args.model_class == "BartForTokenAttentionSparseCLSJoint_incremental":
+        model = BartForTokenAttentionSparseCLSJoint_incremental.from_pretrained(
+            args.model_name_or_path,
+            from_tf=bool(".ckpt" in args.model_name_or_path),
+            config=config,
+            ignore_mismatched_sizes=args.ignore_mismatched_sizes,
+            training_mask_layer=args.hidden_state_layer
+        )
+    elif args.model_class == "BartForTokenAttentionSparseCLSJointSTE":
+        model = BartForTokenAttentionSparseCLSJointSTE.from_pretrained(
+            args.model_name_or_path,
+            from_tf=bool(".ckpt" in args.model_name_or_path),
+            config=config,
+            ignore_mismatched_sizes=args.ignore_mismatched_sizes,
+        )
+    elif args.model_class == "BartForTokenAttentionSparseCLSJointScalar":
+        model = BartForTokenAttentionSparseCLSJointScalar.from_pretrained(
+            args.model_name_or_path,
+            from_tf=bool(".ckpt" in args.model_name_or_path),
+            config=config,
+            ignore_mismatched_sizes=args.ignore_mismatched_sizes,
+        )
+    elif args.model_class == "BartForTokenAttentionSparseCLSJointSTR":
+        model = BartForTokenAttentionSparseCLSJointSTR.from_pretrained(
+            args.model_name_or_path,
+            from_tf=bool(".ckpt" in args.model_name_or_path),
+            config=config,
+            ignore_mismatched_sizes=args.ignore_mismatched_sizes,
+        )
+    elif args.model_class == "BartForTokenAttentionSparseCLSJoint_1minusMask":
+        model = BartForTokenAttentionSparseCLSJoint_1minusMask.from_pretrained(
+            args.model_name_or_path,
+            from_tf=bool(".ckpt" in args.model_name_or_path),
+            config=config,
+            ignore_mismatched_sizes=args.ignore_mismatched_sizes,
+        )
+    elif args.model_class == "BertForSequenceClassification":
+        model = BertForSequenceClassification.from_pretrained(
+            args.model_name_or_path,
+            config=config,
+        )
     elif args.model_class == "BertForTokenAttentionSparseCLSJoint":
         model = BertForTokenAttentionSparseCLSJoint.from_pretrained(
+            args.model_name_or_path,
+            config=config,
+        )
+    elif args.model_class == "BertForTokenAttentionSparseCLSJoint_incremental":
+        model = BertForTokenAttentionSparseCLSJoint_incremental.from_pretrained(
+            args.model_name_or_path,
+            from_tf=bool(".ckpt" in args.model_name_or_path),
+            config=config,
+            ignore_mismatched_sizes=args.ignore_mismatched_sizes,
+            training_mask_layer=args.hidden_state_layer
+        )
+    elif args.model_class == "T5ForSequenceClassification":
+        model = T5ForSequenceClassification.from_pretrained(
             args.model_name_or_path,
             config=config,
         )
@@ -366,6 +491,14 @@ def main():
             from_tf=bool(".ckpt" in args.model_name_or_path),
             config=config,
             ignore_mismatched_sizes=args.ignore_mismatched_sizes,
+        )
+    elif args.model_class == "T5ForTokenAttentionSparseCLSJoint_incremental":
+        model = T5ForTokenAttentionSparseCLSJoint_incremental.from_pretrained(
+            args.model_name_or_path,
+            from_tf=bool(".ckpt" in args.model_name_or_path),
+            config=config,
+            ignore_mismatched_sizes=args.ignore_mismatched_sizes,
+            training_mask_layer=args.hidden_state_layer
         )
     else:
         model = AutoModelForSequenceClassification.from_pretrained(
@@ -554,7 +687,10 @@ def main():
         all_predictions = []
         for step, batch in enumerate(tqdm(eval_dataloader, total=len(eval_dataloader)) ):
             with torch.no_grad():
-                outputs = model(**batch)
+                if "incremental" in args.model_class:
+                    outputs = model(**batch, output_hidden_states=True, hidden_state_layer=args.hidden_state_layer)
+                else:
+                    outputs = model(**batch, output_hidden_states=True)
             if hasattr(outputs, 'disentangle_mask'):
                 if outputs.disentangle_mask is not None:
                     zero_ratio = torch.sum(outputs.disentangle_mask == 0.) / outputs.disentangle_mask.numel()
@@ -610,7 +746,10 @@ def main():
                 total_loss = 0
             for step, batch in enumerate(train_dataloader):
 
-                outputs = model(**batch)
+                if "incremental" in args.model_class:
+                    outputs = model(**batch, output_hidden_states=True, hidden_state_layer=args.hidden_state_layer)
+                else:
+                    outputs = model(**batch, output_hidden_states=True)
                 #print(outputs.disentangle_mask, "num zero", torch.sum(outputs.disentangle_mask==0.))
                 loss = outputs.loss
                 # We keep track of the loss at each epoch
@@ -641,7 +780,10 @@ def main():
             all_predictions = []
             for step, batch in enumerate(eval_dataloader):
                 with torch.no_grad():
-                    outputs = model(**batch)
+                    if "incremental" in args.model_class:
+                        outputs = model(**batch, output_hidden_states=True, hidden_state_layer=args.hidden_state_layer)
+                    else:
+                        outputs = model(**batch, output_hidden_states=True)
                 if hasattr(outputs, 'disentangle_mask'):
                     if outputs.disentangle_mask is not None:
                         zero_ratio = torch.sum(outputs.disentangle_mask == 0.) / outputs.disentangle_mask.numel()
