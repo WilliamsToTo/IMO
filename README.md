@@ -1,4 +1,4 @@
-# IMG
+# IMO
 
 ## Table of Contents
 - [Setup](#installation)
