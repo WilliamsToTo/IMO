@@ -18,6 +18,7 @@ import math
 import random
 import warnings
 from typing import List, Optional, Tuple, Union
+from dataclasses import dataclass
 
 import torch
 import torch.utils.checkpoint
@@ -80,6 +81,15 @@ BART_PRETRAINED_MODEL_ARCHIVE_LIST = [
     # see all BART models at https://huggingface.co/models?filter=bart
 ]
 
+@dataclass
+class BaseModelOutput_MaskLayer(BaseModelOutput):
+    last_layer_mask: Optional[torch.FloatTensor] = None
+    layer_mask: Optional[Tuple[torch.FloatTensor]] = None
+
+@dataclass
+class Seq2SeqModelOutput_MaskLayer(Seq2SeqModelOutput):
+    last_layer_mask: Optional[torch.FloatTensor] = None
+    layer_mask: Optional[Tuple[torch.FloatTensor]] = None
 
 def shift_tokens_right(input_ids: torch.Tensor, pad_token_id: int, decoder_start_token_id: int):
     """
@@ -878,6 +888,204 @@ class BartEncoder(BartPretrainedModel):
         )
 
 
+class BartEncoder_MaskLayer(BartPretrainedModel):
+    """
+    Transformer encoder consisting of *config.encoder_layers* self attention layers. Each layer is a
+    [`BartEncoderLayer`].
+
+    Args:
+        config: BartConfig
+        embed_tokens (nn.Embedding): output embedding
+    """
+
+    def __init__(self, config: BartConfig, embed_tokens: Optional[nn.Embedding] = None):
+        super().__init__(config)
+
+        self.dropout = config.dropout
+        self.layerdrop = config.encoder_layerdrop
+
+        embed_dim = config.d_model
+        self.padding_idx = config.pad_token_id
+        self.max_source_positions = config.max_position_embeddings
+        self.embed_scale = math.sqrt(embed_dim) if config.scale_embedding else 1.0
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, embed_dim, self.padding_idx)
+
+        if embed_tokens is not None:
+            self.embed_tokens.weight = embed_tokens.weight
+
+        self.embed_positions = BartLearnedPositionalEmbedding(
+            config.max_position_embeddings,
+            embed_dim,
+        )
+        self.layers = nn.ModuleList([BartEncoderLayer(config) for _ in range(config.encoder_layers)])
+        self.mask_layers = nn.ModuleList([MaskedElementWiseVector(config.hidden_size) for _ in range(config.encoder_layers)])
+        self.layernorm_embedding = nn.LayerNorm(embed_dim)
+
+        # freeze non mask layers.
+        self.freeze_params(self.embed_tokens)
+        self.freeze_params(self.embed_positions)
+        self.freeze_params(self.layers)
+        self.freeze_params(self.layernorm_embedding)
+
+        self.gradient_checkpointing = False
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.embed_tokens = value
+
+    def freeze_params(self, model: nn.Module):
+        """Set requires_grad=False for each of model.parameters()"""
+        for par in model.parameters():
+            par.requires_grad = False
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, BaseModelOutput]:
+        r"""
+        Args:
+            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+                Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you
+                provide it.
+
+                Indices can be obtained using [`BartTokenizer`]. See [`PreTrainedTokenizer.encode`] and
+                [`PreTrainedTokenizer.__call__`] for details.
+
+                [What are input IDs?](../glossary#input-ids)
+            attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
+                Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
+
+                - 1 for tokens that are **not masked**,
+                - 0 for tokens that are **masked**.
+
+                [What are attention masks?](../glossary#attention-mask)
+            head_mask (`torch.Tensor` of shape `(encoder_layers, encoder_attention_heads)`, *optional*):
+                Mask to nullify selected heads of the attention modules. Mask values selected in `[0, 1]`:
+
+                - 1 indicates the head is **not masked**,
+                - 0 indicates the head is **masked**.
+
+            inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
+                Optionally, instead of passing `input_ids` you can choose to directly pass an embedded representation.
+                This is useful if you want more control over how to convert `input_ids` indices into associated vectors
+                than the model's internal embedding lookup matrix.
+            output_attentions (`bool`, *optional*):
+                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
+                returned tensors for more detail.
+            output_hidden_states (`bool`, *optional*):
+                Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors
+                for more detail.
+            return_dict (`bool`, *optional*):
+                Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
+        """
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # retrieve input_ids and inputs_embeds
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+        elif input_ids is not None:
+            input = input_ids
+            input_ids = input_ids.view(-1, input_ids.shape[-1])
+        elif inputs_embeds is not None:
+            input = inputs_embeds[:, :, -1]
+        else:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids) * self.embed_scale
+
+        embed_pos = self.embed_positions(input)
+        embed_pos = embed_pos.to(inputs_embeds.device)
+
+        hidden_states = inputs_embeds + embed_pos
+        hidden_states = self.layernorm_embedding(hidden_states)
+        hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+
+        # expand attention_mask
+        if attention_mask is not None:
+            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+            attention_mask = _expand_mask(attention_mask, inputs_embeds.dtype)
+
+        encoder_states = () if output_hidden_states else None
+        all_attentions = () if output_attentions else None
+        layer_mask = ()
+
+        # check if head_mask has a correct number of layers specified if desired
+        if head_mask is not None:
+            if head_mask.size()[0] != (len(self.layers)):
+                raise ValueError(
+                    f"The head_mask should be specified for {len(self.layers)} layers, but it is for"
+                    f" {head_mask.size()[0]}."
+                )
+
+        for idx, (encoder_layer, encoder_layer_mask) in enumerate(zip(self.layers, self.mask_layers)):
+            if output_hidden_states:
+                encoder_states = encoder_states + (hidden_states,)
+
+            # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
+            dropout_probability = random.uniform(0, 1)
+            if self.training and (dropout_probability < self.layerdrop):  # skip the layer
+                layer_outputs = (None, None)
+            else:
+                if self.gradient_checkpointing and self.training:
+
+                    def create_custom_forward(module):
+                        def custom_forward(*inputs):
+                            return module(*inputs, output_attentions)
+
+                        return custom_forward
+
+                    layer_outputs = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(encoder_layer),
+                        hidden_states,
+                        attention_mask,
+                        (head_mask[idx] if head_mask is not None else None),
+                    )
+                else:
+                    layer_outputs = encoder_layer(
+                        hidden_states,
+                        attention_mask,
+                        layer_head_mask=(head_mask[idx] if head_mask is not None else None),
+                        output_attentions=output_attentions,
+                    )
+
+                hidden_states, mask_weight = encoder_layer_mask(layer_outputs[0])
+                layer_mask = layer_mask + (mask_weight, )
+                #hidden_states = layer_outputs[0]
+
+            if output_attentions:
+                all_attentions = all_attentions + (layer_outputs[1],)
+
+        last_layer_mask = layer_mask[-1]
+        if output_hidden_states:
+            encoder_states = encoder_states + (hidden_states,)
+
+        if not return_dict:
+            return tuple(v for v in [hidden_states, encoder_states, all_attentions] if v is not None)
+        return BaseModelOutput_MaskLayer(
+            last_hidden_state=hidden_states,
+            hidden_states=encoder_states,
+            attentions=all_attentions,
+            last_layer_mask = last_layer_mask,
+            layer_mask=layer_mask
+        )
+
+
 class BartDecoder(BartPretrainedModel):
     """
     Transformer decoder consisting of *config.decoder_layers* layers. Each layer is a [`BartDecoderLayer`]
@@ -1287,6 +1495,134 @@ class BartModel(BartPretrainedModel):
         )
 
 
+class BartModel_MaskLayer(BartPretrainedModel):
+    _keys_to_ignore_on_load_missing = ["encoder.embed_tokens.weight", "decoder.embed_tokens.weight"]
+
+    def __init__(self, config: BartConfig):
+        super().__init__(config)
+
+        padding_idx, vocab_size = config.pad_token_id, config.vocab_size
+        self.shared = nn.Embedding(vocab_size, config.d_model, padding_idx)
+
+        self.encoder = BartEncoder_MaskLayer(config, self.shared)
+        self.decoder = BartDecoder(config, self.shared)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.shared
+
+    def set_input_embeddings(self, value):
+        self.shared = value
+        self.encoder.embed_tokens = self.shared
+        self.decoder.embed_tokens = self.shared
+
+    def get_encoder(self):
+        return self.encoder
+
+    def get_decoder(self):
+        return self.decoder
+
+    @add_start_docstrings_to_model_forward(BART_INPUTS_DOCSTRING)
+    @add_code_sample_docstrings(
+        processor_class=_TOKENIZER_FOR_DOC,
+        checkpoint=_CHECKPOINT_FOR_DOC,
+        output_type=Seq2SeqModelOutput,
+        config_class=_CONFIG_FOR_DOC,
+        expected_output=_EXPECTED_OUTPUT_SHAPE,
+    )
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        decoder_input_ids: Optional[torch.LongTensor] = None,
+        decoder_attention_mask: Optional[torch.LongTensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        decoder_head_mask: Optional[torch.Tensor] = None,
+        cross_attn_head_mask: Optional[torch.Tensor] = None,
+        encoder_outputs: Optional[List[torch.FloatTensor]] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        decoder_inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, Seq2SeqModelOutput]:
+
+        # different to other models, Bart automatically creates decoder_input_ids from
+        # input_ids if no decoder_input_ids are provided
+        if decoder_input_ids is None and decoder_inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError(
+                    "If no `decoder_input_ids` or `decoder_inputs_embeds` are "
+                    "passed, `input_ids` cannot be `None`. Please pass either "
+                    "`input_ids` or `decoder_input_ids` or `decoder_inputs_embeds`."
+                )
+
+            decoder_input_ids = shift_tokens_right(
+                input_ids, self.config.pad_token_id, self.config.decoder_start_token_id
+            )
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if encoder_outputs is None:
+            encoder_outputs = self.encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                head_mask=head_mask,
+                inputs_embeds=inputs_embeds,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+        # If the user passed a tuple for encoder_outputs, we wrap it in a BaseModelOutput when return_dict=True
+        elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):
+            encoder_outputs = BaseModelOutput(
+                last_hidden_state=encoder_outputs[0],
+                hidden_states=encoder_outputs[1] if len(encoder_outputs) > 1 else None,
+                attentions=encoder_outputs[2] if len(encoder_outputs) > 2 else None,
+            )
+
+        # decoder outputs consists of (dec_features, past_key_value, dec_hidden, dec_attn)
+        decoder_outputs = self.decoder(
+            input_ids=decoder_input_ids,
+            attention_mask=decoder_attention_mask,
+            encoder_hidden_states=encoder_outputs[0],
+            encoder_attention_mask=attention_mask,
+            head_mask=decoder_head_mask,
+            cross_attn_head_mask=cross_attn_head_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=decoder_inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        if not return_dict:
+            return decoder_outputs + encoder_outputs
+
+        return Seq2SeqModelOutput_MaskLayer(
+            last_hidden_state=decoder_outputs.last_hidden_state,
+            past_key_values=decoder_outputs.past_key_values,
+            decoder_hidden_states=decoder_outputs.hidden_states,
+            decoder_attentions=decoder_outputs.attentions,
+            cross_attentions=decoder_outputs.cross_attentions,
+            encoder_last_hidden_state=encoder_outputs.last_hidden_state,
+            encoder_hidden_states=encoder_outputs.hidden_states,
+            encoder_attentions=encoder_outputs.attentions,
+            last_layer_mask=encoder_outputs.last_layer_mask,
+            layer_mask=encoder_outputs.layer_mask,
+        )
+
+
 @add_start_docstrings(
     "The BART Model with a language modeling head. Can be used for summarization.", BART_START_DOCSTRING
 )
@@ -1483,7 +1819,7 @@ class BartForSequenceClassification(BartPretrainedModel):
         super().__init__(config)
         self.num_labels = config.num_labels
         self.model = BartModel(config)
-        #self.freeze_params(self.model)
+        self.freeze_params(self.model)
 
         #self.pooler = PoolerLayer(config)
         #classifier_dropout = 0.1
@@ -1665,7 +2001,6 @@ class BartForTokenAttentionCLS(BartPretrainedModel):
             attentions=encoder_outputs.attentions,
         )
 
-
 @add_start_docstrings(
     "Bart model for disentangled representation learning. ", BART_START_DOCSTRING
 )
@@ -1761,6 +2096,123 @@ class BartForDisentangledRepresentation(BartPretrainedModel):
             last_hidden_states=encoder_outputs.last_hidden_state,
             disentangle_mask=mask_weight,
             disentangled_hidden_states=masked_embeddings,
+            attentions=encoder_outputs.attentions,
+        )
+
+class BartForDisentangledRepresentation_incremental(BartPretrainedModel):
+    base_model_prefix = "model"
+
+    def __init__(self, config: BartConfig, training_mask_layer):
+        '''
+
+        :param config:
+        :param training_mask_layer: range [1, 12]
+        '''
+        super().__init__(config)
+        self.num_labels = config.num_labels
+        self.model = BartModel(config)
+        self.freeze_params(self.model)
+
+        self.learnable_mask_layers = nn.ModuleList([MaskedElementWiseVector(config.hidden_size) for _ in range(config.encoder_layers)])
+        self.freeze_params(self.learnable_mask_layers)
+        # activate training_mask_layer
+        for param in self.learnable_mask_layers[training_mask_layer-1].parameters():
+            param.requires_grad = True
+
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+        self.alpha = 0.0005 # scale for regularization of mask layer
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_encoder(self):
+        return self.model.get_encoder()
+
+    def get_decoder(self):
+        return self.model.get_decoder()
+
+    def freeze_params(self, model: nn.Module):
+        """Set requires_grad=False for each of model.parameters()"""
+        for par in model.parameters():
+            par.requires_grad = False
+
+    def resize_token_embeddings(self, new_num_tokens: int) -> nn.Embedding:
+        new_embeddings = super().resize_token_embeddings(new_num_tokens)
+        self._resize_final_logits_bias(new_num_tokens)
+        return new_embeddings
+
+    def _resize_final_logits_bias(self, new_num_tokens: int) -> None:
+        old_num_tokens = self.final_logits_bias.shape[-1]
+        if new_num_tokens <= old_num_tokens:
+            new_bias = self.final_logits_bias[:, :new_num_tokens]
+        else:
+            extra_bias = torch.zeros((1, new_num_tokens - old_num_tokens), device=self.final_logits_bias.device)
+            new_bias = torch.cat([self.final_logits_bias, extra_bias], dim=1)
+        self.register_buffer("final_logits_bias", new_bias)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        hidden_state_layer: Optional[int] = 12,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple[torch.Tensor], Seq2SeqLMOutput]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        encoder_outputs = self.model.encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        bsz, seq_len, hidden_size = encoder_outputs["last_hidden_state"].shape
+        # recompute hidden states that after hidden_state_layer
+        attention_mask = _expand_mask(attention_mask, encoder_outputs["last_hidden_state"].dtype)
+        next_hidden_state = encoder_outputs["hidden_states"][hidden_state_layer]
+        last_mask_weight = None
+        trained_mask_weights = []
+        for cur_layer in range(hidden_state_layer, 13):
+            cur_layer_masked_embeddings, cur_layer_masked_weight = \
+                self.learnable_mask_layers[cur_layer-1](next_hidden_state)
+            trained_mask_weights.append(cur_layer_masked_weight)
+            if cur_layer < 12:
+                next_hidden_state = \
+                self.model.encoder.layers[cur_layer](cur_layer_masked_embeddings, attention_mask, head_mask)[0]
+            else:
+                next_hidden_state = cur_layer_masked_embeddings
+                last_mask_weight = cur_layer_masked_weight
+
+        masked_embeddings = next_hidden_state
+        merged_label_vector = torch.sum(masked_embeddings, dim=1)
+        logits = self.classifier(merged_label_vector)
+        loss = None
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            loss += self.alpha * torch.sum(torch.exp(-self.learnable_mask_layers[hidden_state_layer-1].threshold))
+            #print(loss, type(loss))
+
+        return DisentangledSequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=encoder_outputs.hidden_states,
+            last_hidden_states=encoder_outputs.last_hidden_state,
+            disentangle_mask=trained_mask_weights[0],
+            disentangled_hidden_states=next_hidden_state,
+            token_attention_vector=None,
             attentions=encoder_outputs.attentions,
         )
 
@@ -1921,6 +2373,7 @@ class BartForTokenAttentionSparseCLSJoint(BartPretrainedModel):
         labels: Optional[torch.LongTensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        hidden_state_layer: Optional[int] = 12,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple[torch.Tensor], Seq2SeqLMOutput]:
         r"""
@@ -1940,8 +2393,8 @@ class BartForTokenAttentionSparseCLSJoint(BartPretrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-        bsz, seq_len, hidden_size = encoder_outputs["last_hidden_state"].shape
-        masked_embeddings, mask_weight = self.learnable_mask(encoder_outputs["last_hidden_state"])
+        bsz, seq_len, hidden_size = encoder_outputs["hidden_states"][hidden_state_layer].shape
+        masked_embeddings, mask_weight = self.learnable_mask(encoder_outputs["hidden_states"][hidden_state_layer])
         attn_weights = torch.bmm(masked_embeddings,
                                  mask_weight.unsqueeze(1).unsqueeze(0).expand(bsz, self.config.hidden_size, 1))
         attn_weights = nn.functional.softmax(attn_weights, dim=1)
@@ -1962,6 +2415,359 @@ class BartForTokenAttentionSparseCLSJoint(BartPretrainedModel):
             last_hidden_states=encoder_outputs.last_hidden_state,
             disentangle_mask=mask_weight,
             disentangled_hidden_states=masked_embeddings,
+            token_attention_vector=attn_weights,
+            attentions=encoder_outputs.attentions,
+        )
+
+class BartForTokenAttentionSparseCLSJoint_MaskLayer(BartPretrainedModel):
+    base_model_prefix = "model"
+
+    def __init__(self, config: BartConfig):
+        super().__init__(config)
+        self.num_labels = config.num_labels
+        self.model = BartModel_MaskLayer(config)
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+        self.alpha = 0.0005 # scale for regularization of mask layer
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_encoder(self):
+        return self.model.get_encoder()
+
+    def get_decoder(self):
+        return self.model.get_decoder()
+
+    def freeze_params(self, model: nn.Module):
+        """Set requires_grad=False for each of model.parameters()"""
+        for par in model.parameters():
+            par.requires_grad = False
+
+    def resize_token_embeddings(self, new_num_tokens: int) -> nn.Embedding:
+        new_embeddings = super().resize_token_embeddings(new_num_tokens)
+        self._resize_final_logits_bias(new_num_tokens)
+        return new_embeddings
+
+    def _resize_final_logits_bias(self, new_num_tokens: int) -> None:
+        old_num_tokens = self.final_logits_bias.shape[-1]
+        if new_num_tokens <= old_num_tokens:
+            new_bias = self.final_logits_bias[:, :new_num_tokens]
+        else:
+            extra_bias = torch.zeros((1, new_num_tokens - old_num_tokens), device=self.final_logits_bias.device)
+            new_bias = torch.cat([self.final_logits_bias, extra_bias], dim=1)
+        self.register_buffer("final_logits_bias", new_bias)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        hidden_state_layer: Optional[int] = 12,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple[torch.Tensor], Seq2SeqLMOutput]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        encoder_outputs = self.model.encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        bsz, seq_len, hidden_size = encoder_outputs["hidden_states"][hidden_state_layer].shape
+        masked_embeddings = encoder_outputs["hidden_states"][hidden_state_layer]
+        mask_weight = encoder_outputs["last_layer_mask"]
+        #masked_embeddings, mask_weight = self.learnable_mask(encoder_outputs["hidden_states"][hidden_state_layer])
+        attn_weights = torch.bmm(masked_embeddings,
+                                 mask_weight.unsqueeze(1).unsqueeze(0).expand(bsz, self.config.hidden_size, 1))
+        attn_weights = nn.functional.softmax(attn_weights, dim=1)
+        masked_embeddings = masked_embeddings * attn_weights.expand(bsz, seq_len, hidden_size)
+        merged_label_vector = torch.sum(masked_embeddings, dim=1)
+        logits = self.classifier(merged_label_vector)
+        loss = None
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            loss += self.alpha * torch.sum(torch.exp(-self.model.encoder.mask_layers[hidden_state_layer-1].threshold))
+            #print(loss, type(loss))
+
+        return DisentangledSequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=encoder_outputs.hidden_states,
+            last_hidden_states=encoder_outputs.last_hidden_state,
+            disentangle_mask=mask_weight,
+            disentangled_hidden_states=masked_embeddings,
+            token_attention_vector=attn_weights,
+            attentions=encoder_outputs.attentions,
+        )
+
+class BartForTokenAttentionSparseCLSJoint_incremental(BartPretrainedModel):
+    base_model_prefix = "model"
+
+    def __init__(self, config: BartConfig, training_mask_layer):
+        '''
+
+        :param config:
+        :param training_mask_layer: range [1, 12]
+        '''
+        super().__init__(config)
+        self.num_labels = config.num_labels
+        self.model = BartModel(config)
+        self.freeze_params(self.model)
+
+        self.learnable_mask_layers = nn.ModuleList([MaskedElementWiseVector(config.hidden_size) for _ in range(config.encoder_layers)])
+        self.freeze_params(self.learnable_mask_layers)
+        # activate training_mask_layer
+        for param in self.learnable_mask_layers[training_mask_layer-1].parameters():
+            param.requires_grad = True
+
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+        self.alpha = 0.0005 # scale for regularization of mask layer
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_encoder(self):
+        return self.model.get_encoder()
+
+    def get_decoder(self):
+        return self.model.get_decoder()
+
+    def freeze_params(self, model: nn.Module):
+        """Set requires_grad=False for each of model.parameters()"""
+        for par in model.parameters():
+            par.requires_grad = False
+
+    def resize_token_embeddings(self, new_num_tokens: int) -> nn.Embedding:
+        new_embeddings = super().resize_token_embeddings(new_num_tokens)
+        self._resize_final_logits_bias(new_num_tokens)
+        return new_embeddings
+
+    def _resize_final_logits_bias(self, new_num_tokens: int) -> None:
+        old_num_tokens = self.final_logits_bias.shape[-1]
+        if new_num_tokens <= old_num_tokens:
+            new_bias = self.final_logits_bias[:, :new_num_tokens]
+        else:
+            extra_bias = torch.zeros((1, new_num_tokens - old_num_tokens), device=self.final_logits_bias.device)
+            new_bias = torch.cat([self.final_logits_bias, extra_bias], dim=1)
+        self.register_buffer("final_logits_bias", new_bias)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        hidden_state_layer: Optional[int] = 12,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple[torch.Tensor], Seq2SeqLMOutput]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        encoder_outputs = self.model.encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        bsz, seq_len, hidden_size = encoder_outputs["last_hidden_state"].shape
+        # recompute hidden states that after hidden_state_layer
+        attention_mask = _expand_mask(attention_mask, encoder_outputs["last_hidden_state"].dtype)
+        next_hidden_state = encoder_outputs["hidden_states"][hidden_state_layer]
+        last_mask_weight = None
+        trained_mask_weights = []
+        for cur_layer in range(hidden_state_layer, 13):
+            cur_layer_masked_embeddings, cur_layer_masked_weight = \
+                self.learnable_mask_layers[cur_layer-1](next_hidden_state)
+            trained_mask_weights.append(cur_layer_masked_weight)
+            if cur_layer < 12:
+                next_hidden_state = \
+                self.model.encoder.layers[cur_layer](cur_layer_masked_embeddings, attention_mask, head_mask)[0]
+            else:
+                next_hidden_state = cur_layer_masked_embeddings
+                last_mask_weight = cur_layer_masked_weight
+
+        attn_weights = torch.bmm(next_hidden_state,
+                                 last_mask_weight.unsqueeze(1).unsqueeze(0).expand(bsz, self.config.hidden_size, 1))
+        attn_weights = nn.functional.softmax(attn_weights, dim=1)
+        masked_embeddings = next_hidden_state * attn_weights.expand(bsz, seq_len, hidden_size)
+        merged_label_vector = torch.sum(masked_embeddings, dim=1)
+        logits = self.classifier(merged_label_vector)
+        loss = None
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            loss += self.alpha * torch.sum(torch.exp(-self.learnable_mask_layers[hidden_state_layer-1].threshold))
+            #print(loss, type(loss))
+
+        return DisentangledSequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=encoder_outputs.hidden_states,
+            last_hidden_states=encoder_outputs.last_hidden_state,
+            disentangle_mask=trained_mask_weights[0],
+            disentangled_hidden_states=next_hidden_state,
+            token_attention_vector=attn_weights,
+            attentions=encoder_outputs.attentions,
+        )
+
+
+class BartForTokenAttentionSparseCLSJoint_incrementalAggregate(BartPretrainedModel):
+    base_model_prefix = "model"
+
+    def __init__(self, config: BartConfig, training_mask_layer):
+        '''
+
+        :param config:
+        :param training_mask_layer: range [1, 12]
+        '''
+        super().__init__(config)
+        self.num_labels = config.num_labels
+        self.model = BartModel(config)
+        self.freeze_params(self.model)
+
+        self.learnable_mask_layers = nn.ModuleList([MaskedElementWiseVector(config.hidden_size) for _ in range(config.encoder_layers)])
+        self.freeze_params(self.learnable_mask_layers)
+        # activate training_mask_layer
+        for param in self.learnable_mask_layers[training_mask_layer-1].parameters():
+            param.requires_grad = True
+
+        self.classifier_mask_layers = nn.ModuleList(
+            [MaskedElementWiseVector(config.hidden_size) for _ in range(config.encoder_layers)])
+        self.freeze_params(self.classifier_mask_layers)
+        # activate training_mask_layer
+        for param in self.classifier_mask_layers[training_mask_layer - 1].parameters():
+            param.requires_grad = True
+
+        self.classifier = nn.Linear(12*config.hidden_size, config.num_labels)
+        self.alpha = 0.0005 # scale for regularization of mask layer
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_encoder(self):
+        return self.model.get_encoder()
+
+    def get_decoder(self):
+        return self.model.get_decoder()
+
+    def freeze_params(self, model: nn.Module):
+        """Set requires_grad=False for each of model.parameters()"""
+        for par in model.parameters():
+            par.requires_grad = False
+
+    def resize_token_embeddings(self, new_num_tokens: int) -> nn.Embedding:
+        new_embeddings = super().resize_token_embeddings(new_num_tokens)
+        self._resize_final_logits_bias(new_num_tokens)
+        return new_embeddings
+
+    def _resize_final_logits_bias(self, new_num_tokens: int) -> None:
+        old_num_tokens = self.final_logits_bias.shape[-1]
+        if new_num_tokens <= old_num_tokens:
+            new_bias = self.final_logits_bias[:, :new_num_tokens]
+        else:
+            extra_bias = torch.zeros((1, new_num_tokens - old_num_tokens), device=self.final_logits_bias.device)
+            new_bias = torch.cat([self.final_logits_bias, extra_bias], dim=1)
+        self.register_buffer("final_logits_bias", new_bias)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        hidden_state_layer: Optional[int] = 12,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple[torch.Tensor], Seq2SeqLMOutput]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        encoder_outputs = self.model.encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        bsz, seq_len, hidden_size = encoder_outputs["last_hidden_state"].shape
+        # recompute hidden states that after hidden_state_layer
+        attention_mask = _expand_mask(attention_mask, encoder_outputs["last_hidden_state"].dtype)
+        next_hidden_state = encoder_outputs["hidden_states"][hidden_state_layer]
+        last_mask_weight = None
+        trained_mask_weights = []
+        each_layer_label_vectors = []
+
+        for cur_layer in range(hidden_state_layer, 13):
+            cur_layer_masked_embeddings, cur_layer_mask_weight = \
+                self.learnable_mask_layers[cur_layer-1](next_hidden_state)
+            cur_layer_classifier_masked_embeddings, cur_layer_classifier_mask_weight = \
+                self.classifier_mask_layers[cur_layer - 1](next_hidden_state)
+            trained_mask_weights.append(cur_layer_mask_weight)
+            # compute token attentions per layer
+            attn_weights = torch.bmm(cur_layer_classifier_masked_embeddings,
+                                     cur_layer_classifier_mask_weight.unsqueeze(1).unsqueeze(0).expand(bsz, self.config.hidden_size, 1))
+            attn_weights = nn.functional.softmax(attn_weights, dim=1)
+            masked_embeddings = cur_layer_classifier_masked_embeddings * attn_weights.expand(bsz, seq_len, hidden_size)
+            cur_layer_merged_label_vector = torch.sum(masked_embeddings, dim=1)
+            each_layer_label_vectors.append(cur_layer_merged_label_vector)
+            # feed to next layer
+            if cur_layer < 12:
+                next_hidden_state = \
+                self.model.encoder.layers[cur_layer](cur_layer_masked_embeddings, attention_mask, head_mask)[0]
+            else:
+                next_hidden_state = cur_layer_masked_embeddings
+                last_mask_weight = cur_layer_mask_weight
+
+        each_layer_label_vectors = [torch.zeros(bsz, hidden_size).to(next_hidden_state.device) for _ in range(1, hidden_state_layer)] \
+                                   + each_layer_label_vectors
+        all_layer_label_vectors = torch.cat(each_layer_label_vectors, dim=1)
+        logits = self.classifier(all_layer_label_vectors)
+        loss = None
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            loss += self.alpha * torch.sum(torch.exp(-self.learnable_mask_layers[hidden_state_layer-1].threshold))
+            loss += 0.5 * torch.sum(torch.exp(-self.classifier_mask_layers[hidden_state_layer - 1].threshold))
+            #print(loss, type(loss))
+
+        return DisentangledSequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=encoder_outputs.hidden_states,
+            last_hidden_states=encoder_outputs.last_hidden_state,
+            disentangle_mask=trained_mask_weights[0],
+            disentangled_hidden_states=next_hidden_state,
             token_attention_vector=attn_weights,
             attentions=encoder_outputs.attentions,
         )
@@ -2062,6 +2868,124 @@ class BartForTokenAttentionSparseCLSJoint_1minusMask(BartPretrainedModel):
             token_attention_vector=attn_weights,
             attentions=encoder_outputs.attentions,
         )
+
+class BartForTokenAttentionSparseCLSJoint_incremental_1minusMask(BartPretrainedModel):
+    base_model_prefix = "model"
+
+    def __init__(self, config: BartConfig, training_mask_layer):
+        '''
+
+        :param config:
+        :param training_mask_layer: range [1, 12]
+        '''
+        super().__init__(config)
+        self.num_labels = config.num_labels
+        self.model = BartModel(config)
+        self.freeze_params(self.model)
+
+        self.learnable_mask_layers = nn.ModuleList([MaskedElementWiseVector(config.hidden_size) for _ in range(config.encoder_layers)])
+        self.freeze_params(self.learnable_mask_layers)
+
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+        self.alpha = 0.0005 # scale for regularization of mask layer
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_encoder(self):
+        return self.model.get_encoder()
+
+    def get_decoder(self):
+        return self.model.get_decoder()
+
+    def freeze_params(self, model: nn.Module):
+        """Set requires_grad=False for each of model.parameters()"""
+        for par in model.parameters():
+            par.requires_grad = False
+
+    def resize_token_embeddings(self, new_num_tokens: int) -> nn.Embedding:
+        new_embeddings = super().resize_token_embeddings(new_num_tokens)
+        self._resize_final_logits_bias(new_num_tokens)
+        return new_embeddings
+
+    def _resize_final_logits_bias(self, new_num_tokens: int) -> None:
+        old_num_tokens = self.final_logits_bias.shape[-1]
+        if new_num_tokens <= old_num_tokens:
+            new_bias = self.final_logits_bias[:, :new_num_tokens]
+        else:
+            extra_bias = torch.zeros((1, new_num_tokens - old_num_tokens), device=self.final_logits_bias.device)
+            new_bias = torch.cat([self.final_logits_bias, extra_bias], dim=1)
+        self.register_buffer("final_logits_bias", new_bias)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        hidden_state_layer: Optional[int] = 12,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple[torch.Tensor], Seq2SeqLMOutput]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        encoder_outputs = self.model.encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        bsz, seq_len, hidden_size = encoder_outputs["last_hidden_state"].shape
+        # recompute hidden states that after hidden_state_layer
+        attention_mask = _expand_mask(attention_mask, encoder_outputs["last_hidden_state"].dtype)
+        next_hidden_state = encoder_outputs["hidden_states"][hidden_state_layer]
+        last_mask_weight = None
+        trained_mask_weights = []
+        for cur_layer in range(hidden_state_layer, 13):
+            cur_layer_masked_embeddings, cur_layer_masked_weight = \
+                self.learnable_mask_layers[cur_layer-1](next_hidden_state)
+            trained_mask_weights.append(cur_layer_masked_weight)
+            if cur_layer < 12:
+                next_hidden_state = \
+                self.model.encoder.layers[cur_layer](cur_layer_masked_embeddings, attention_mask, head_mask)[0]
+            else:
+                next_hidden_state = cur_layer_masked_embeddings
+                last_mask_weight = cur_layer_masked_weight
+
+        attn_weights = torch.bmm(next_hidden_state,
+                                 last_mask_weight.unsqueeze(1).unsqueeze(0).expand(bsz, self.config.hidden_size, 1))
+        attn_weights = nn.functional.softmax(attn_weights, dim=1)
+        masked_embeddings = next_hidden_state * attn_weights.expand(bsz, seq_len, hidden_size)
+        merged_label_vector = torch.sum(masked_embeddings, dim=1)
+        logits = self.classifier(merged_label_vector)
+        loss = None
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            loss += self.alpha * torch.sum(torch.exp(-self.learnable_mask_layers[hidden_state_layer-1].threshold))
+            #print(loss, type(loss))
+
+        return DisentangledSequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=encoder_outputs.hidden_states,
+            last_hidden_states=encoder_outputs.last_hidden_state,
+            disentangle_mask=trained_mask_weights[0],
+            disentangled_hidden_states=next_hidden_state,
+            token_attention_vector=attn_weights,
+            attentions=encoder_outputs.attentions,
+        )
+
 
 class BartForTokenAttentionSparseCLSJointSTE(BartPretrainedModel):
     base_model_prefix = "model"
@@ -2795,5 +3719,139 @@ class BartForTokenAttentionSparseCLSJointMultiClass(BartPretrainedModel):
             disentangle_mask=weight_masks,
             disentangled_hidden_states=masked_embeddings_wrt_labels,
             token_attention_vector=attn_weights_wrt_labels,
+            attentions=encoder_outputs.attentions,
+        )
+
+class BartForTokenAttentionSparseCLSJointMultiClass_incremental(BartPretrainedModel):
+    base_model_prefix = "model"
+
+    def __init__(self, config: BartConfig, training_mask_layer):
+        super().__init__(config)
+        self.num_labels = config.num_labels
+        self.learnable_mask_layers = nn.ModuleList(
+            [MaskedElementWiseVector(config.hidden_size) for _ in range(config.encoder_layers)])
+        self.freeze_params(self.learnable_mask_layers)
+        # activate training_mask_layer
+        for param in self.learnable_mask_layers[training_mask_layer - 1].parameters():
+            param.requires_grad = True
+
+        self.convert2scalar_vectors = nn.ParameterList([
+            nn.Parameter(torch.randn(config.hidden_size, 1)) for _ in range(self.num_labels)
+        ])
+        self.alpha = 0.0005 # scale for regularization of mask layer
+        self.beta = 0.005 # scale for regularization of distance between mask layers
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def freeze_params(self, model: nn.Module):
+        """Set requires_grad=False for each of model.parameters()"""
+        for par in model.parameters():
+            par.requires_grad = False
+
+    def resize_token_embeddings(self, new_num_tokens: int) -> nn.Embedding:
+        new_embeddings = super().resize_token_embeddings(new_num_tokens)
+        self._resize_final_logits_bias(new_num_tokens)
+        return new_embeddings
+
+    def _resize_final_logits_bias(self, new_num_tokens: int) -> None:
+        old_num_tokens = self.final_logits_bias.shape[-1]
+        if new_num_tokens <= old_num_tokens:
+            new_bias = self.final_logits_bias[:, :new_num_tokens]
+        else:
+            extra_bias = torch.zeros((1, new_num_tokens - old_num_tokens), device=self.final_logits_bias.device)
+            new_bias = torch.cat([self.final_logits_bias, extra_bias], dim=1)
+        self.register_buffer("final_logits_bias", new_bias)
+
+    def distance_loss(self, vectors):
+        # shape of vectors [num_label, 1024]
+        # Normalize the input vectors to unit vectors
+        normalized_batch = nn.functional.normalize(vectors, p=2, dim=1)
+
+        # Calculate the cosine similarity matrix
+        similarity_matrix = torch.matmul(normalized_batch, normalized_batch.t())
+
+        # Remove the diagonal elements (self-similarity) and apply a mask
+        mask = torch.eye(vectors.shape[0]).to(similarity_matrix.device) == 0
+        similarity_matrix = similarity_matrix.masked_select(mask)
+
+        # Penalize high similarity values by taking the mean
+        loss = torch.mean(similarity_matrix)
+
+        return loss
+
+    def forward(
+        self,
+        backbone_model = None,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        hidden_state_layer: Optional[int] = 12,
+    ) -> Union[Tuple[torch.Tensor], Seq2SeqLMOutput]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        encoder_outputs = backbone_model.encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        bsz, seq_len, hidden_size = encoder_outputs["last_hidden_state"].shape
+        # recompute hidden states that after hidden_state_layer
+        attention_mask = _expand_mask(attention_mask, encoder_outputs["last_hidden_state"].dtype)
+        next_hidden_state = encoder_outputs["hidden_states"][hidden_state_layer]
+        last_mask_weight = None
+        trained_mask_weights = []
+        for cur_layer in range(hidden_state_layer, 13):
+            cur_layer_masked_embeddings, cur_layer_masked_weight = \
+                self.learnable_mask_layers[cur_layer - 1](next_hidden_state)
+            trained_mask_weights.append(cur_layer_masked_weight)
+            if cur_layer < 12:
+                next_hidden_state = \
+                    self.model.encoder.layers[cur_layer](cur_layer_masked_embeddings, attention_mask, head_mask)[0]
+            else:
+                next_hidden_state = cur_layer_masked_embeddings
+                last_mask_weight = cur_layer_masked_weight
+
+        attn_weights = torch.bmm(next_hidden_state,
+                                 last_mask_weight.unsqueeze(1).unsqueeze(0).expand(bsz, self.config.hidden_size, 1))
+        attn_weights = nn.functional.softmax(attn_weights, dim=1)
+        masked_embeddings = next_hidden_state * attn_weights.expand(bsz, seq_len, hidden_size)
+        merged_label_vector = torch.sum(masked_embeddings, dim=1)
+        label_scores = []
+        for convert_vector in self.convert2scalar_vectors:
+            label_score = torch.matmul(merged_label_vector, convert_vector)
+            label_scores.append(label_score)
+        logits = torch.cat(label_scores, dim=1)
+        # logits = self.classifier(merged_label_vector)
+        loss = None
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            loss += self.alpha * torch.sum(torch.exp(-self.learnable_mask_layers[hidden_state_layer - 1].threshold))
+            # print(loss, type(loss))
+
+        return DisentangledSequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=encoder_outputs.hidden_states,
+            last_hidden_states=encoder_outputs.last_hidden_state,
+            disentangle_mask=trained_mask_weights[0],
+            disentangled_hidden_states=next_hidden_state,
+            token_attention_vector=attn_weights,
             attentions=encoder_outputs.attentions,
         )

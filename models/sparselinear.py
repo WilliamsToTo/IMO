@@ -110,6 +110,7 @@ class MaskedElementWiseVector(nn.Module):
         #threshold = self.threshold.view(abs_weight.shape[0], -1)
         abs_weight = abs_weight - self.threshold
         mask = self.step(abs_weight)
+        #mask = torch.abs(1-mask)
         ratio = torch.sum(mask) / mask.numel()
         # print("keep ratio {:.2f}".format(ratio))
         if ratio <= 0.01:
@@ -120,6 +121,7 @@ class MaskedElementWiseVector(nn.Module):
             abs_weight = abs_weight - self.threshold
             mask = self.step(abs_weight)
         masked_weight = self.weight * mask
+        masked_weight = sharp_activate(masked_weight)
         output = input * masked_weight
         return output, masked_weight
 

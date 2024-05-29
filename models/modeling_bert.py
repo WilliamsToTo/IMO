@@ -52,6 +52,7 @@ from transformers.utils import (
 from transformers import BertConfig
 
 from .modeling_m2m_100 import DisentangledSequenceClassifierOutput
+from .modeling_bart import _expand_mask
 from .sparselinear import SparseLinear, MaskedMLP, MaskedElementWiseVector
 
 
@@ -1541,6 +1542,10 @@ class BertForSequenceClassification(BertPreTrainedModel):
         expected_output=_SEQ_CLASS_EXPECTED_OUTPUT,
         expected_loss=_SEQ_CLASS_EXPECTED_LOSS,
     )
+    def freeze_params(self, model: nn.Module):
+        """Set requires_grad=False for each of model.parameters()"""
+        for par in model.parameters():
+            par.requires_grad = False
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
@@ -1739,6 +1744,7 @@ class BertForTokenClassification(BertPreTrainedModel):
         expected_output=_TOKEN_CLASS_EXPECTED_OUTPUT,
         expected_loss=_TOKEN_CLASS_EXPECTED_LOSS,
     )
+
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
@@ -1771,6 +1777,7 @@ class BertForTokenClassification(BertPreTrainedModel):
         )
 
         sequence_output = outputs[0]
+
 
         sequence_output = self.dropout(sequence_output)
         logits = self.classifier(sequence_output)
@@ -1976,6 +1983,110 @@ class BertForTokenAttentionSparseCLSJoint(BertPreTrainedModel):
             disentangled_hidden_states=masked_embeddings,
             token_attention_vector=attn_weights,
             attentions=outputs.attentions,
+        )
+
+class BertForTokenAttentionSparseCLSJoint_incremental(BertPreTrainedModel):
+    base_model_prefix = "model"
+
+    def __init__(self, config: BertConfig, training_mask_layer):
+        '''
+
+        :param config:
+        :param training_mask_layer: range [1, 24]
+        '''
+        super().__init__(config)
+        self.num_labels = config.num_labels
+        self.bert = BertModel(config)
+        self.freeze_params(self.bert)
+
+        self.learnable_mask_layers = nn.ModuleList([MaskedElementWiseVector(config.hidden_size) for _ in range(config.num_hidden_layers)])
+        self.freeze_params(self.learnable_mask_layers)
+        # activate training_mask_layer
+        for param in self.learnable_mask_layers[training_mask_layer-1].parameters():
+            param.requires_grad = True
+
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+        self.alpha = 0.0005 # scale for regularization of mask layer
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def freeze_params(self, model: nn.Module):
+        """Set requires_grad=False for each of model.parameters()"""
+        for par in model.parameters():
+            par.requires_grad = False
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        token_type_ids: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        hidden_state_layer: Optional[int] = 24,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple[torch.Tensor], DisentangledSequenceClassifierOutput]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        encoder_outputs = self.bert(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        bsz, seq_len, hidden_size = encoder_outputs["last_hidden_state"].shape
+        # recompute hidden states that after hidden_state_layer
+        attention_mask = _expand_mask(attention_mask, encoder_outputs["last_hidden_state"].dtype)
+        next_hidden_state = encoder_outputs["hidden_states"][hidden_state_layer]
+        last_mask_weight = None
+        trained_mask_weights = []
+        for cur_layer in range(hidden_state_layer, 25):
+            cur_layer_masked_embeddings, cur_layer_masked_weight = \
+                self.learnable_mask_layers[cur_layer-1](next_hidden_state)
+            trained_mask_weights.append(cur_layer_masked_weight)
+            if cur_layer < 24:
+                next_hidden_state = \
+                self.bert.encoder.layer[cur_layer](cur_layer_masked_embeddings, attention_mask, head_mask)[0]
+            else:
+                next_hidden_state = cur_layer_masked_embeddings
+                last_mask_weight = cur_layer_masked_weight
+
+        attn_weights = torch.bmm(next_hidden_state,
+                                 last_mask_weight.unsqueeze(1).unsqueeze(0).expand(bsz, self.config.hidden_size, 1))
+        attn_weights = nn.functional.softmax(attn_weights, dim=1)
+        masked_embeddings = next_hidden_state * attn_weights.expand(bsz, seq_len, hidden_size)
+        merged_label_vector = torch.sum(masked_embeddings, dim=1)
+        logits = self.classifier(merged_label_vector)
+        loss = None
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            loss += self.alpha * torch.sum(torch.exp(-self.learnable_mask_layers[hidden_state_layer-1].threshold))
+            #print(loss, type(loss))
+
+        return DisentangledSequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=encoder_outputs.hidden_states,
+            last_hidden_states=encoder_outputs.last_hidden_state,
+            disentangle_mask=trained_mask_weights[0],
+            disentangled_hidden_states=next_hidden_state,
+            token_attention_vector=attn_weights,
+            attentions=encoder_outputs.attentions,
         )
 
 class BertForTokenAttentionSparseCLSJointMultiClass(BertPreTrainedModel):
